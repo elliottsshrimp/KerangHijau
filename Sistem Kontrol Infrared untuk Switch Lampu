@@ -1,0 +1,127 @@
+import time
+from machine import Pin, PWM
+import bluetooth
+import struct
+from micropython import const
+
+# 1. KONFIGURASI STATUS VIRTUAL & HARDWARE IR (PIN 4)
+status_lampu_sekarang = "MATI"
+
+pwm_pin = Pin(4)
+pwm = PWM(pwm_pin)
+pwm.freq(38000) 
+
+DUTY_LOW_CARRIER = 32768  
+DUTY_HIGH_OFF = 0         
+
+input_biner = [0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,0,1,0,0,0,1,0,0,1,0,1,1,1,0,1]
+
+# 2. FUNGSI EMISI INFRARED: TOGGLE POWER
+def eksekusi_ir_toggle():
+    print("-> Menembakkan Sinyal IR (Toggle Power)...")
+    pwm.duty_u16(DUTY_LOW_CARRIER); time.sleep_us(9156) 
+    pwm.duty_u16(DUTY_HIGH_OFF); time.sleep_us(4440)
+    pwm.duty_u16(DUTY_LOW_CARRIER); time.sleep_us(600)
+
+    for bit in input_biner:
+        if bit == 1:
+            pwm.duty_u16(DUTY_HIGH_OFF); time.sleep_us(1649) 
+            pwm.duty_u16(DUTY_LOW_CARRIER); time.sleep_us(600)
+        else:
+            pwm.duty_u16(DUTY_HIGH_OFF); time.sleep_us(550) 
+            pwm.duty_u16(DUTY_LOW_CARRIER); time.sleep_us(600)
+
+    # Rangkaian Ekor Penutup Lengkap
+    pwm.duty_u16(DUTY_HIGH_OFF); time.sleep_us(39150)
+    pwm.duty_u16(DUTY_LOW_CARRIER); time.sleep_us(9000)
+    pwm.duty_u16(DUTY_HIGH_OFF); time.sleep_us(2200)
+    pwm.duty_u16(DUTY_LOW_CARRIER); time.sleep_us(600)
+    pwm.duty_u16(DUTY_HIGH_OFF); time.sleep_us(39000)
+    pwm.duty_u16(DUTY_HIGH_OFF); time.sleep_us(95150)
+    pwm.duty_u16(DUTY_LOW_CARRIER); time.sleep_us(9150)
+    pwm.duty_u16(DUTY_HIGH_OFF); time.sleep_us(2150)
+    pwm.duty_u16(DUTY_LOW_CARRIER); time.sleep_us(650)
+    pwm.duty_u16(DUTY_HIGH_OFF); time.sleep_us(95200)
+    pwm.duty_u16(DUTY_LOW_CARRIER); time.sleep_us(9050)
+    pwm.duty_u16(DUTY_HIGH_OFF); time.sleep_us(2250)
+    pwm.duty_u16(DUTY_LOW_CARRIER); time.sleep_us(550)
+    pwm.duty_u16(DUTY_HIGH_OFF)
+    print("-> Sinyal Selesai Dikirim!")
+
+# 3. KONFIGURASI BLE (BLUETOOTH LOW ENERGY)
+_SERVICE_UUID = bluetooth.UUID("12345678-1234-5678-1234-56789abcdef0")
+_CHAR_RX = bluetooth.UUID("12345678-1234-5678-1234-56789abcdef1")  # HP -> ESP32 (Write)
+_CHAR_TX = bluetooth.UUID("12345678-1234-5678-1234-56789abcdef2")  # ESP32 -> HP (Notify)
+
+_FLAG_WRITE = const(0x0008)
+_FLAG_NOTIFY = const(0x0010)
+
+ble = bluetooth.BLE()
+ble.active(True)
+connections = set()
+
+# Fungsi untuk mengirim teks status ke HP lewat Bluetooth
+def send_status(text):
+    data = text.encode()
+    for c in connections:
+        ble.gatts_notify(c, tx_handle, data)
+
+# Handler Event Bluetooth (IRQ)
+def ble_irq(event, data):
+    global status_lampu_sekarang
+
+    if event == 1:  # Central / HP terhubung
+        conn_handle, _, _ = data
+        connections.add(conn_handle)
+        print("BLE: HP Terhubung!")
+
+    elif event == 2:  # Central / HP terputus
+        conn_handle, _, _ = data
+        connections.remove(conn_handle)
+        print("BLE: HP Terputus. Memulai Broadcast ulang...")
+        ble.gap_advertise(100, adv_data=adv_data)
+
+    elif event == 3:  # HP mengirim data/perintah (Write)
+        conn_handle, attr_handle = data
+        
+        # Baca pesan dari HP dan bersihkan spasi
+        msg = ble.gatts_read(rx_handle).decode().strip()
+        print("Menerima Perintah BLE:", msg)
+
+        # Jika HP mengirim perintah "TOGGLE"
+        if msg == "go":
+            # 1. Jalankan tembakan infra merah fisik
+            eksekusi_ir_toggle()
+            
+            # 2. Perbarui status virtual lampu
+            if status_lampu_sekarang == "MATI":
+                status_lampu_sekarang = "NYALA"
+            else:
+                status_lampu_sekarang = "MATI"
+            
+            print(f"Status Lampu Saat Ini: {status_lampu_sekarang}")
+            
+            # 3. Kirim balik teks status ke aplikasi HP secara real-time
+            send_status(f"STATUS:{status_lampu_sekarang}")
+
+# Registrasi GATT Service BLE
+TX = (_CHAR_TX, _FLAG_NOTIFY)
+RX = (_CHAR_RX, _FLAG_WRITE)
+SERVICE = (_SERVICE_UUID, (TX, RX))
+((tx_handle, rx_handle),) = ble.gatts_register_services((SERVICE,))
+
+ble.irq(ble_irq)
+
+# Konfigurasi Nama Bluetooth ESP32 saat di-scan (Kita namai "FISIKA_IR")
+NAMA_BLE = "FISIKA_IR"
+adv_data = b'\x02\x01\x06' + bytes([len(NAMA_BLE) + 1, 0x09]) + NAMA_BLE.encode()
+ble.gap_advertise(100, adv_data=adv_data)
+
+print(f"BLE Aktif! Silakan hubungkan iPhone ke Bluetooth bernama '{NAMA_BLE}'")
+
+
+# 4. LOOP UTAMA (Standby & Cek Status)
+while True:
+    # Karena BLE bekerja secara asynchronous via Interrupt (IRQ),
+    # Loop utama dibiarkan tidur rileks agar menghemat resource ESP32.
+    time.sleep(1)
